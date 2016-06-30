@@ -1,0 +1,260 @@
+
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <string.h>
+#include "mem.h"
+#define BLOCK_ALIGN 4
+/* this structure serves as the header for each block */ 
+typedef struct block_hd{
+	/* The blocks are maintained as a linked list */
+	/* The blocks are ordered in the increasing order of addresses */
+	struct block_hd* next;
+
+	/* size of the block is always a multiple of 4 */
+	/* ie, last two bits are always zero - can be used to store other information*/
+	/* LSB = 0 => free block */
+	/* LSB = 1 => allocated/busy block */
+	/* The value stored here does not include the space required to store the header */
+
+	
+	int size_status;
+
+}block_header;
+
+/* Global variable - This will always point to the first block */
+/* ie, the block with the lowest address */
+block_header* list_head = NULL;
+
+
+/* Function used to Initialize the memory allocator */
+/* Not intended to be called more than once by a program */
+/* Argument - sizeOfRegion: Specifies the size of the chunk which needs to be allocated */
+/* Returns 0 on success and -1 on failure */ 
+
+int Mem_Init(int sizeOfRegion) {
+	int pagesize;
+	int padsize;
+	int fd;
+	int alloc_size;
+	void* space_ptr;
+	static int allocated_once = 0;
+
+	if(0 != allocated_once)
+	{
+		fprintf(stderr,"Error:mem.c: Mem_Init has allocated space during a previous call\n");
+		return -1;
+	}
+	if(sizeOfRegion <= 0)
+	{
+		fprintf(stderr,"Error:mem.c: Requested block size is not positive\n");
+		return -1;
+	}
+
+	/* Get the pagesize */
+	pagesize = getpagesize();
+
+	/* Calculate padsize as the padding required to round up sizeOfRegio to a multiple of pagesize */
+	padsize = sizeOfRegion % pagesize;
+	padsize = (pagesize - padsize) % pagesize;
+
+	alloc_size = sizeOfRegion + padsize;
+
+	/* Using mmap to allocate memory */
+	fd = open("/dev/zero", O_RDWR);
+	if(-1 == fd)
+	{
+		fprintf(stderr,"Error:mem.c: Cannot open /dev/zero\n");
+		return -1;
+	}
+	space_ptr = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+	if (MAP_FAILED == space_ptr)
+	{
+		fprintf(stderr,"Error:mem.c: mmap cannot allocate space\n");
+		allocated_once = 0;
+		return -1;
+	}
+
+	allocated_once = 1;
+	list_head = (block_header*)space_ptr;
+	list_head->next = NULL;
+	
+	list_head->size_status = alloc_size - (int)sizeof(block_header);
+
+	return 0;
+}
+
+
+/* Function for allocating 'size' bytes. */
+/* Returns address of allocated block on success */
+/* Returns NULL on failure */
+/* Here is what this function should accomplish */
+/* - Check for sanity of size - Return NULL when appropriate */
+/* - Round up size to a multiple of 4 */
+/* - Traverse the list of blocks and allocate the best free block which can accommodate the requested size */
+/* -- Also, when allocating a block - split it into two blocks when possible */
+/* Tips: Be careful with pointer arithmetic */
+void* Mem_Alloc(int size)
+{
+	/* Your code should go in here */
+	
+	block_header* newHeader = NULL;
+	
+	block_header* curr = list_head;
+	//round up the size in parameter
+	int remainder = size % BLOCK_ALIGN;
+	int newSize = size + (BLOCK_ALIGN-remainder)%BLOCK_ALIGN;
+	while(curr != NULL){
+	
+		if((curr->size_status % BLOCK_ALIGN) == 0 && curr->size_status == newSize){
+		
+			newHeader = curr;
+			newHeader->size_status = newHeader->size_status +1;
+			//return the pointer to the beginning of the payload
+			return (block_header*)((char*)newHeader+sizeof(block_header));
+		}
+		//if newHeader is NULL, assign newHeader to the first block that is large enough 
+		if(curr->size_status %BLOCK_ALIGN ==0 && curr->size_status > newSize && newHeader ==NULL){
+			newHeader = curr;			
+		}
+		//if newHeader is not NULL,update it only when current free block size is smaller than previous one but larger than allocation size
+		if(curr->size_status %BLOCK_ALIGN ==0 && curr->size_status > newSize && newHeader != NULL){
+			if(curr->size_status < newHeader->size_status){
+				newHeader = curr;
+			}
+		}		
+		curr = curr->next;
+	}
+	//if newHeader is NULL, return
+	if(newHeader == NULL)
+		return newHeader;
+	
+	//In order to be splited, the rest size is at least one block_Align plus one header
+	if((newHeader->size_status - newSize)>=(BLOCK_ALIGN + sizeof(block_header))){
+		//compute the position and size_status  for the split block and new block 
+		block_header* split =(block_header*)((char*)newHeader + sizeof(block_header)+ newSize);
+		split->next = newHeader->next;
+		split->size_status = newHeader->size_status - newSize - sizeof(block_header);
+		newHeader->next = split;
+		newHeader->size_status = newSize;
+	}
+	//update newHeader to indicate being allocated 
+	newHeader->size_status = 1+ newHeader->size_status;
+	return (block_header*)((char*)newHeader+sizeof(block_header));	
+}			
+
+
+/* Function for freeing up a previously allocated block */
+/* Argument - ptr: Address of the block to be freed up */
+/* Returns 0 on success */
+/* Returns -1 on failure */
+/* - Return -1 if ptr is NULL */
+/* - Return -1 if ptr is not pointing to the first byte of a busy block */
+/* - Mark the block as free */
+/* - Coalesce if one or both of the immediate neighbours are free */ 
+int Mem_Free(void *ptr) {
+	/* Your code should go in here */
+	if(ptr == NULL) return -1;
+	block_header* curr = list_head;
+	while(curr != NULL){
+		//if there exists a pointer that matches the parameter and it is currently being allocated
+		if(ptr == ((char*)curr+sizeof(block_header)) && curr->size_status % BLOCK_ALIGN == 1){
+			//update the size_status
+			curr->size_status = curr->size_status -1;
+			//determine if colision wiht next is needed
+			block_header* next = curr->next;
+			if(next!=NULL && next->size_status % BLOCK_ALIGN ==0){
+				curr->next = next->next;
+				curr->size_status = curr->size_status + sizeof(block_header) + next->size_status;
+			}		
+			//determine if colision with previous block is needed
+			//when the curr is not the first block in the list
+			if(curr != list_head){
+
+				block_header* pre = list_head;
+			
+				while( pre->next != curr)
+					pre = pre->next; 
+
+				if(pre->size_status % BLOCK_ALIGN ==0){
+					pre->next = curr->next;
+					pre->size_status = pre->size_status + sizeof(block_header) + curr->size_status;
+				}		
+
+
+			}
+			return 0;
+		}
+		curr = curr->next; 
+	}
+	//if ptr is valid but no result matches its address to free, return -1	
+	return -1;
+
+}
+
+/* Function to be used for debug */
+/* Prints out a list of all the blocks along with the following information for each block */
+/* No.      : Serial number of the block */
+/* Status   : free/busy */
+/* Begin    : Address of the first useful byte in the block */
+/* End      : Address of the last byte in the block */
+/* Size     : Size of the block (excluding the header) */
+/* t_Size   : Size of the block (including the header) */
+/* t_Begin  : Address of the first byte in the block (this is where the header starts) */ void Mem_Dump() {
+	int counter;
+	block_header* current = NULL;
+	char* t_Begin = NULL;
+	char* Begin = NULL;
+	int Size;
+	int t_Size;
+	char* End = NULL;
+	int free_size;
+	int busy_size;
+	int total_size;
+	char status[5];
+
+	free_size = 0;
+	busy_size = 0;
+	total_size = 0;
+	current = list_head;
+	counter = 1;
+	fprintf(stdout,"************************************Block list***********************************\n");
+	fprintf(stdout,"No.\tStatus\tBegin\t\tEnd\t\tSize\tt_Size\tt_Begin\n");
+	fprintf(stdout,"---------------------------------------------------------------------------------\n");
+	while(NULL != current)
+	{
+		t_Begin = (char*)current;
+		Begin = t_Begin + (int)sizeof(block_header);
+		Size = current->size_status;
+		strcpy(status,"Free");
+		if(Size & 1) /*LSB = 1 => busy block*/
+		{
+			strcpy(status,"Busy");
+			Size = Size - 1; /*Minus one for ignoring status in busy block*/
+			t_Size = Size + (int)sizeof(block_header);
+			busy_size = busy_size + t_Size;
+		}
+		else
+		{
+			t_Size = Size + (int)sizeof(block_header);
+			free_size = free_size + t_Size;
+		}
+		End = Begin + Size;
+		fprintf(stdout,"%d\t%s\t0x%08lx\t0x%08lx\t%d\t%d\t0x%08lx\n",counter,status,(unsigned long int)Begin,(unsigned long int)End,Size,t_Size,(unsigned long int)t_Begin);
+		total_size = total_size + t_Size;
+		current = current->next;
+		counter = counter + 1;
+	}
+	fprintf(stdout,"---------------------------------------------------------------------------------\n");
+	fprintf(stdout,"*********************************************************************************\n");
+
+	fprintf(stdout,"Total busy size = %d\n",busy_size);
+	fprintf(stdout,"Total free size = %d\n",free_size);
+	fprintf(stdout,"Total size = %d\n",busy_size+free_size);
+	fprintf(stdout,"*********************************************************************************\n");
+	fflush(stdout);
+	return;
+}
